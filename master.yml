@@ -1,0 +1,197 @@
+#cloud-config
+
+hostname: master
+coreos:
+  etcd:
+    name: master
+    addr: PRIVATE_IPV4:4001
+    bind-addr: 0.0.0.0
+    peer-addr: PRIVATE_IPV4:7001
+    discovery: https://discovery.etcd.io/e1b70e64607a32864d4fb19128b2865f
+    peer-heartbeat-interval: 250
+    peer-election-timeout: 1000
+  units:
+    - name: cbr0.netdev
+      command: start
+      content: |
+        [NetDev]
+        Kind=bridge
+        Name=cbr0
+    - name: cbr0.network
+      command: start
+      content: |
+        [Match]
+        Name=cbr0
+
+        [Network]
+        Address=10.244.0.1/24
+
+        [Route]
+        Destination=10.0.0.0/8
+        Gateway=0.0.0.0
+    - name: cbr0-interface.network
+      command: start
+      content: |
+        [Match]
+        Name=ens34
+
+        [Network]
+        Bridge=cbr0
+    - name: nat.service
+      command: start
+      content: |
+        [Unit]
+        Description=NAT non container traffic
+
+        [Service]
+        ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o ens33 -j MASQUERADE ! -d 10.0.0.0/8
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: etcd.service
+      command: start
+      after: replace-ipv4.service
+    - name: fleet.service
+      command: start
+      after: etcd.service
+    - name: docker.service
+      command: start
+      content: |
+        [Unit]
+        After=network.target
+        Description=Docker Application Container Engine
+        Documentation=http://docs.docker.io
+
+        [Service]
+        ExecStartPre=/bin/mount --make-rprivate /
+        ExecStart=/usr/bin/docker -d -s=btrfs -H fd:// -b cbr0 --iptables=false
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: download-kubernetes.service
+      command: start
+      content: |
+        [Unit]
+        After=network-online.target
+
+        Before=apiserver.service
+        Before=controller-manager.service
+
+        Before=kubelet.service
+        Before=proxy.service
+        Description=Download Kubernetes Binaries
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=network-online.target
+
+        [Service]
+
+        ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/apiserver
+        ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/controller-manager
+        ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kubecfg
+
+        ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/kubelet
+        ExecStart=/usr/bin/wget -N -P /opt/bin http://storage.googleapis.com/kubernetes/proxy
+
+        ExecStart=/usr/bin/chmod +x /opt/bin/apiserver
+        ExecStart=/usr/bin/chmod +x /opt/bin/controller-manager
+        ExecStart=/usr/bin/chmod +x /opt/bin/kubecfg
+
+        ExecStart=/usr/bin/chmod +x /opt/bin/kubelet
+        ExecStart=/usr/bin/chmod +x /opt/bin/proxy
+        RemainAfterExit=yes
+        Type=oneshot
+
+    - name: apiserver.service
+      command: start
+      after: replace-ipv4.service
+      content: |
+        [Unit]
+        ConditionFileIsExecutable=/opt/bin/apiserver
+        Description=Kubernetes API Server
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+
+        [Service]
+        ExecStart=/opt/bin/apiserver \
+        --address=127.0.0.1 \
+        --port=8080 \
+        --etcd_servers=http://127.0.0.1:4001 \
+        --machines=PRIVATE_IPV4,10.184.6.58,10.184.6.68 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: controller-manager.service
+      command: start
+      content: |
+        [Unit]
+        ConditionFileIsExecutable=/opt/bin/controller-manager
+        Description=Kubernetes Controller Manager
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+
+        [Service]
+        ExecStart=/opt/bin/controller-manager \
+        --master=127.0.0.1:8080 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+
+    - name: kubelet.service
+      command: start
+      after: replace-ipv4.service
+      content: |
+        [Unit]
+        ConditionFileIsExecutable=/opt/bin/kubelet
+        Description=Kubernetes Kubelet
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+
+        [Service]
+        ExecStart=/opt/bin/kubelet \
+        --address=0.0.0.0 \
+        --port=10250 \
+        --hostname_override=PRIVATE_IPV4 \
+        --etcd_servers=http://127.0.0.1:4001 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: proxy.service
+      command: start
+      content: |
+        [Unit]
+        ConditionFileIsExecutable=/opt/bin/proxy
+        Description=Kubernetes Proxy
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+
+        [Service]
+        ExecStart=/opt/bin/proxy --etcd_servers=http://127.0.0.1:4001 --logtostderr=true
+        Restart=always
+        RestartSec=2
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: replace-ipv4.service
+      command: start
+      content: |
+        [Unit]
+        Description=sets up ipv4 configurations
+
+        [Service]
+        Before=etcd.service
+        Before=kubelet.service
+        Before=apiserver.service
+        Type=oneshot
+        ExecStart=/bin/sh -c "sed -i \"s/PRIVATE_IPV4/`ifconfig bond0.401 | grep 'inet ' | awk '{print $2}'`/\" /run/systemd/system/etcd.service.d/20-cloudinit.conf /etc/systemd/system/kubelet.service /etc/systemd/system/apiserver.service && systemctl daemon-reload && systemctl etcd restart"
+  update:
+    group: alpha
+    reboot-strategy: off
+manage_etc_hosts: localhost
+ssh_authorized_keys:
+    - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDYny9rA6S0uN2HK8SHmB0z21vTaOw891FARfHJEMe4Rj9sr9l8cMbWhgFUacrP5594MEDV3malf0RLwxyU/+StR3glJsiDbz67FRlJBozULu+4ADh7hy13QcCd0gYkBjReHG5amsBFJUWaFF1mzrVlqFcLLJbhBqVXc4878S8th5sYmXTEkQ6FrxXhZgbwM6CzcB0s96vAdh+pSUR+wJxOAXiwaBXa05/7niYKDDyOUnk8vZ/uxmZF1m89is8keWtuz7/XV9Rdwf647hJiEXZUBV573K9f1rN+jWx6ayDG5FuDMKrxe0npsoCSPumtjTZLGDB8h7tmVTU0/6IZBeEr jeremy.schlatter@rackspace.com
+    - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCnq+oPeDmkDeVMsPLwWMKC+0kYQu1PlQdb31AexVHyCwUT7rxwxXKI+DOOHmyh+O64xyduUDYc7SI2IN0WIWyJ+M3wIC2cnOaPP8DKnt943sJwVI0unVndLRdeU2N4dAki0be1tBRQf7zR+CmUDiYF12m4wQ3nVmBdaC/DDNx57oF2F4kOhAxHfkLt/SCgZDj2ymAEeR62bK783IMjtmk/7udTruI+8qtAMRdokvhHZnS0FxhDXRdXm8yTtc9b3x7LPaGVdz7k0HgDoo+dfLR1zaqStEF+/OWePWFa7Q4FB2tJfQcGwFZcwtmabni88Zp6ZiEVhz/yEb4hzc05ZB78Sa/Y06o7I/ati1hP3Sor+ZG8CC7BuJ2BikLwkG1mB6SCziMtHoRp7ZWDkfbSTXNNbqCQxuRKaZ4/LRBhGqyK46gTaoDjyi8buhZQ7I/EOeamE4/xvd7CsEL/VX5Vw9radd+AtP/49MLpExcULaR2f4U45JpVGJR587eDZHkaF90gSvRG/4dNQMriIYSvK1ldpheGN0safozKsi6JfWnDpIZdZjt3vnvbv69ukNSeFkLzjPTnfMDpPDkaq2cCuD5XVgVHFxY8ZmYksFmwbwBwjezCGxGxelTUOsTC4YgaGhSCafKwakYTCybddCBk3JJ6v9kvhBKG5131y835zVZVsQ== cyli@paper-airplane.local
+    - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDKE7lUvlmSPcTpfDCxB7EJULCa1ClLOY3A+6+pwD5l34eZdyrw30593JQoXPsbTvdztOJuPmFQ3rwPTRE7bGkvRIl81D01nvq0Fgpzjq6aDnHZtEPuzl7V3qBoziiuL31HIJPmDRTd0PfDzGKsby8IlDzgQar5vMEpttsG1FNzdHfEBB0kHP82y5DvOWF7M0KwGG/PkjDmGwS4jw4nXF0KBlZFwQhQJf+5AvCGGQZvvLLO7vsrtOiT4KGwYusXeQRJ4hlKT3O393c/D6Nf/4/EZrEgLdk4fngty7jXUx/nHBV+U1KKAJd3OlxT2t4snYXWztPsRGSIdXW+bnKOs6c/ klizhentas@gmail.com
